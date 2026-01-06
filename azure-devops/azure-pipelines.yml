@@ -3,52 +3,79 @@ trigger:
     include:
       - main
 
-pr:
-  branches:
-    include:
-      - main
+pool:
+  vmImage: "ubuntu-latest"
 
 variables:
   pythonVersion: "3.11"
-  imageName: "demo-api"
-  dockerfilePath: "Dockerfile"
-
-pool:
-  vmImage: "ubuntu-latest"
+  imageRepo: "demo-api"
 
 stages:
   - stage: Build_Test
     displayName: "Build + Test"
     jobs:
-      - job: build_test
-        displayName: "Python deps + basic tests"
+      - job: test
         steps:
           - checkout: self
 
           - task: UsePythonVersion@0
             inputs:
               versionSpec: "$(pythonVersion)"
-            displayName: "Use Python $(pythonVersion)"
 
           - script: |
               python -m pip install --upgrade pip
               pip install -r app/requirements.txt
-            displayName: "Install dependencies"
-
-          - script: |
               python -c "import flask; print('flask ok')"
-            displayName: "Basic import test"
+            displayName: "Install deps + basic test"
 
-  - stage: Docker_Build
-    displayName: "Docker Build"
+  - stage: Build_Push_ACR
+    displayName: "Docker Build + Push to ACR"
     dependsOn: Build_Test
     jobs:
-      - job: docker_build
-        displayName: "Build Docker image"
+      - job: docker
         steps:
           - checkout: self
 
+          - task: Docker@2
+            displayName: "Build and push to ACR"
+            inputs:
+              containerRegistry: "ACR_SERVICE_CONNECTION"
+              repository: "$(imageRepo)"
+              command: "buildAndPush"
+              Dockerfile: "Dockerfile"
+              buildContext: "."
+              tags: |
+                $(Build.BuildId)
+                latest
+
+  - stage: Deploy_AKS
+    displayName: "Deploy to AKS with Helm"
+    dependsOn: Build_Push_ACR
+    jobs:
+      - job: deploy
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Get AKS credentials"
+            inputs:
+              azureSubscription: "AZURE_RM_SERVICE_CONNECTION"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az aks get-credentials \
+                  --resource-group "$(AKS_RESOURCE_GROUP)" \
+                  --name "$(AKS_CLUSTER_NAME)" \
+                  --overwrite-existing
+
           - script: |
-              docker build -t $(imageName):$(Build.BuildId) -f $(dockerfilePath) .
-              docker images | head
-            displayName: "Build Docker Image"
+              kubectl create namespace demo --dry-run=client -o yaml | kubectl apply -f -
+            displayName: "Create namespace (if missing)"
+
+          - script: |
+              helm upgrade --install demo-api helm/demo-api \
+                --namespace demo \
+                --set image.repository=$(ACR_LOGIN_SERVER)/$(imageRepo) \
+                --set image.tag=$(Build.BuildId) \
+                --set service.type=LoadBalancer
+            displayName: "Helm deploy"
